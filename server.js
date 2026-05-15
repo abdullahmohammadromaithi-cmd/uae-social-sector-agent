@@ -1,103 +1,95 @@
-# 🇦🇪 UAE Social Sector AI Intelligence Agent
+const express  = require("express");
+const cron     = require("node-cron");
+const path     = require("path");
+const { runAgent } = require("./agent/orchestrator");
 
-A live web app that runs daily, searches the internet for social sector news,
-classifies and synthesises it, and generates UAE-specific AI implementation ideas.
+const app  = express();
+const PORT = process.env.PORT || 3000;
 
-**Stack:** Node.js · Express · Claude API (web search) · GitHub · Render
+let latestBriefing = null;
+let isRunning      = false;
+let lastRunAt      = null;
+let lastError      = null;
+let runLog         = [];
 
----
+app.use(express.static(path.join(__dirname, "public")));
+app.use(express.json());
 
-## Deploy in 4 steps — no terminal needed
+app.get("/api/status", (req, res) => {
+  res.json({
+    ok:           true,
+    isRunning,
+    lastRunAt,
+    lastError,
+    hasBriefing:  !!latestBriefing,
+    briefingDate: latestBriefing?.date || null,
+    apiKeySet:    !!process.env.ANTHROPIC_API_KEY,
+    model:        process.env.AGENT_MODEL || "claude-sonnet-4-20250514",
+  });
+});
 
-### Step 1 — Put the code on GitHub
+app.get("/api/briefing", (req, res) => {
+  if (!latestBriefing) {
+    return res.status(404).json({ error: "No briefing yet. Click Run Now." });
+  }
+  res.json(latestBriefing);
+});
 
-1. Go to **github.com** and sign in (or create a free account)
-2. Click the **+** icon (top right) → **New repository**
-3. Name it `uae-social-sector-agent`, set it to **Public**, click **Create repository**
-4. Click **uploading an existing file**
-5. Drag ALL the files from this folder into the upload area
-   - `server.js`, `package.json`, `render.yaml`, `.gitignore`
-   - The whole `agent/` folder and `public/` folder
-6. Click **Commit changes**
+app.get("/api/log", (req, res) => {
+  res.json({ log: runLog.slice(-50) });
+});
 
----
+app.post("/api/run", async (req, res) => {
+  if (isRunning) {
+    return res.status(409).json({ error: "Agent is already running. Please wait." });
+  }
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return res.status(400).json({ error: "ANTHROPIC_API_KEY is not set in environment variables." });
+  }
+  res.json({ ok: true, message: "Agent started. Refresh in 2-4 minutes." });
+  _runAgent();
+});
 
-### Step 2 — Deploy to Render
+cron.schedule("0 3 * * *", () => {
+  if (!isRunning && process.env.ANTHROPIC_API_KEY) {
+    _log("Scheduled daily run triggered");
+    _runAgent();
+  }
+});
 
-1. Go to **render.com** and sign in with your GitHub account
-2. Click **New +** → **Web Service**
-3. Click **Connect** next to your `uae-social-sector-agent` repo
-4. Render will auto-detect the settings from `render.yaml`. Confirm:
-   - **Build command:** `npm install`
-   - **Start command:** `npm start`
-5. Click **Create Web Service**
+async function _runAgent() {
+  isRunning = true;
+  lastError = null;
+  runLog    = [];
+  _log("Agent pipeline started");
+  try {
+    const briefing = await runAgent({
+      apiKey:    process.env.ANTHROPIC_API_KEY,
+      model:     process.env.AGENT_MODEL || "claude-sonnet-4-20250514",
+      maxTokens: parseInt(process.env.AGENT_MAX_TOKENS || "4096"),
+      nIdeas:    parseInt(process.env.N_IDEAS || "5"),
+      threshold: parseInt(process.env.RELEVANCE_THRESHOLD || "5"),
+      log:       _log,
+    });
+    latestBriefing = briefing;
+    lastRunAt      = new Date().toISOString();
+    _log("Done - " + briefing.stats.scored_articles + " articles, " + briefing.stats.ideas_generated + " ideas");
+  } catch (err) {
+    lastError = err.message;
+    _log("Error: " + err.message);
+    console.error(err);
+  } finally {
+    isRunning = false;
+  }
+}
 
----
+function _log(msg) {
+  const entry = "[" + new Date().toISOString().slice(11,19) + "] " + msg;
+  runLog.push(entry);
+  console.log(entry);
+}
 
-### Step 3 — Add your API key
-
-Still on the Render dashboard for your service:
-
-1. Click **Environment** in the left menu
-2. Click **Add Environment Variable**
-3. Set:
-   - **Key:** `ANTHROPIC_API_KEY`
-   - **Value:** your key from console.anthropic.com
-4. Click **Save Changes** — Render will redeploy automatically
-
----
-
-### Step 4 — Open your live site
-
-Render gives you a URL like `https://uae-social-sector-agent.onrender.com`
-
-Click it. You'll see the dashboard. Click **Run Now** to generate your first briefing.
-
-**After that, it runs automatically every day at 07:00 UAE time.**
-
----
-
-## How it works
-
-```
-Every day at 07:00 UAE (03:00 UTC):
-
-  Claude + web_search
-    ↓ searches 24 queries across 3 clusters
-  Classifier
-    ↓ scores UAE relevance, removes duplicates
-  Synthesiser
-    ↓ extracts trends, actions, urgent signals
-  Idea Generator
-    ↓ generates 5 UAE AI implementation ideas
-  Dashboard
-    ← live web UI updates automatically
-```
-
----
-
-## Cost
-
-- **Render free tier:** Free (spins down after 15 min inactivity — first load takes ~30s)
-- **Claude API:** ~$0.50–$2.00 per daily run (billed to your Anthropic account)
-
----
-
-## Files
-
-```
-├── server.js           Express web server + scheduler
-├── package.json        Node.js dependencies (express, node-cron)
-├── render.yaml         Render deployment config
-├── .gitignore
-├── agent/
-│   ├── orchestrator.js Pipeline coordinator
-│   ├── claude.js       Anthropic API client
-│   ├── keywords.js     Search keyword clusters
-│   ├── collector.js    Step 1: web search & article retrieval
-│   ├── classifier.js   Step 2: scoring & stream classification
-│   ├── synthesiser.js  Step 3: trend synthesis
-│   └── ideagenerator.js Step 4: UAE implementation ideas
-└── public/
-    └── index.html      Live dashboard UI
-```
+app.listen(PORT, () => {
+  console.log("Server running on port " + PORT);
+  console.log("API key set: " + !!process.env.ANTHROPIC_API_KEY);
+});
